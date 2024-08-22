@@ -5,6 +5,10 @@ package todo
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/mitchellh/mapstructure"
@@ -35,7 +39,9 @@ func New() Config {
 				{ID: 3, Text: "Somebody else's todo", Done: true, owner: them},
 				{ID: 4, Text: "Please do this or else", Done: false, owner: you},
 			},
-			lastID: 4,
+			lastID:      4,
+			subscribers: map[string]chan<- []*Todo{},
+			mutex:       sync.Mutex{},
 		},
 	}
 	c.Directives.HasRole = func(ctx context.Context, obj any, next graphql.Resolver, role Role) (any, error) {
@@ -63,8 +69,10 @@ func New() Config {
 }
 
 type resolvers struct {
-	todos  []*Todo
-	lastID int
+	todos       []*Todo
+	lastID      int
+	subscribers map[string]chan<- []*Todo
+	mutex       sync.Mutex
 }
 
 func (r *resolvers) MyQuery() MyQueryResolver {
@@ -73,6 +81,10 @@ func (r *resolvers) MyQuery() MyQueryResolver {
 
 func (r *resolvers) MyMutation() MyMutationResolver {
 	return (*MutationResolver)(r)
+}
+
+func (r *resolvers) MySubscription() MySubscriptionResolver {
+	return (*SubscriptionResolver)(r)
 }
 
 type QueryResolver resolvers
@@ -120,6 +132,7 @@ func (r *MutationResolver) CreateTodo(ctx context.Context, todo TodoInput) (*Tod
 
 	r.todos = append(r.todos, newTodo)
 
+	deliveryTodos(r.todos, r.subscribers, &r.mutex)
 	return newTodo, nil
 }
 
@@ -142,10 +155,73 @@ func (r *MutationResolver) UpdateTodo(ctx context.Context, id int, changes map[s
 		panic(err)
 	}
 
+	deliveryTodos(r.todos, r.subscribers, &r.mutex)
 	return affectedTodo, nil
+}
+
+func (r *MutationResolver) DeleteTodo(ctx context.Context, id int) (bool, error) {
+	var deletedTodos []*Todo
+	findResult := false
+
+	for i := 0; i < len(r.todos); i++ {
+		if r.todos[i].ID == id {
+			findResult = true
+		} else {
+			deletedTodos = append(deletedTodos, r.todos[i])
+		}
+	}
+
+	if !findResult {
+		return false, nil
+	}
+
+	r.todos = deletedTodos
+	deliveryTodos(r.todos, r.subscribers, &r.mutex)
+	return true, nil
 }
 
 func (r *MutationResolver) id() int {
 	r.lastID++
 	return r.lastID
+}
+
+type SubscriptionResolver resolvers
+
+func (r *SubscriptionResolver) SubscriptionTodo(ctx context.Context, userID int) (<-chan []*Todo, error) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	userIDStr := strconv.Itoa(userID)
+	if _, ok := r.subscribers[userIDStr]; ok {
+		err := fmt.Errorf("`%s` has already been subscribed.", userIDStr)
+		log.Print(err.Error())
+		return nil, err
+	}
+
+	// チャンネルを作成し、リストに登録
+	ch := make(chan []*Todo, 1)
+	r.subscribers[userIDStr] = ch
+	log.Printf("`%s` has been subscribed!", userIDStr)
+
+	// コネクションが終了したら、このチャンネルを削除する
+	go func() {
+		<-ctx.Done()
+		r.mutex.Lock()
+		delete(r.subscribers, userIDStr)
+		r.mutex.Unlock()
+		log.Printf("`%s` has been unsubscribed.", userIDStr)
+	}()
+	return ch, nil
+}
+
+// 更新操作をされたらsubscriberにTODOリストを配信する
+func deliveryTodos(todos []*Todo,
+	subscribers map[string]chan<- []*Todo,
+	mutex *sync.Mutex) {
+
+	mutex.Lock()
+	for _, ch := range subscribers {
+		ch <- todos
+	}
+	mutex.Unlock()
 }

@@ -14,6 +14,9 @@ type MyMutation struct {
 type MyQuery struct {
 }
 
+type MySubscription struct {
+}
+
 // Passed to createTodo to create a new todo
 type TodoInput struct {
 	// The body text
